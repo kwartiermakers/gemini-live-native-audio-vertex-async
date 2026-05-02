@@ -30,7 +30,6 @@ from google import genai
 from google.genai import types
 
 
-# Replace with your own Google Cloud project / region before running.
 PROJECT = "your-gcp-project-id"
 LOCATION = "your-gcp-region"
 MODEL = "gemini-live-2.5-flash-native-audio"
@@ -257,6 +256,13 @@ RECENT_USER_TEXT: list[str] = [""]
 # Used by the announce-follow-up nudge so we don't barge in mid-sentence.
 MODEL_LAST_SPOKE: list[float] = [0.0]
 
+# Reference to the playback queue, set in main(). The announce-follow-up nudge
+# checks this to avoid barging in while audio is still queued for playback —
+# MODEL_LAST_SPOKE only tracks when audio was RECEIVED from the API, but
+# Gemini Live often generates faster than real-time so chunks can still be
+# playing seconds after the last data callback.
+OUT_QUEUE_REF: list = [None]
+
 
 URGENT_ALERT_TRIGGERS = (
     "alert", "alarm",
@@ -389,12 +395,13 @@ ANNOUNCE_NUDGES = {
 
 async def announce_after_response(session, name):
     """Fallback nudge — only fires if the model FAILED to announce the
-    FunctionResponse on its own. Two-stage wait:
-      1. Wait for the model to be quiet for `required_quiet` seconds (don't
-         barge in mid-monologue from a previous turn).
-      2. Then wait `grace` seconds for the model to start a new turn on its
-         own (responding to the FunctionResponse). If it does, we skip the
-         nudge — it's announcing naturally, no need to duplicate.
+    FunctionResponse on its own. Three conditions must all hold:
+      1. The model has been quiet (no new audio data) for `required_quiet`s.
+      2. The playback queue is drained — the user has actually finished
+         hearing the previous audio. Without this, we'd barge in while the
+         buffered tail of the previous turn is still playing.
+      3. After both of the above, a `grace` window passes with no new audio
+         from the model. If it starts speaking on its own, we skip the nudge.
     """
     text = ANNOUNCE_NUDGES.get(name)
     if not text:
@@ -402,19 +409,27 @@ async def announce_after_response(session, name):
 
     required_quiet = 1.5
     grace = 2.5
-    max_wait_quiet = 15.0
+    max_wait_quiet = 30.0
+    out_queue = OUT_QUEUE_REF[0]
 
-    # Stage 1: wait until the model has been quiet for `required_quiet`.
+    def model_quiet_for(seconds: float) -> bool:
+        return time.monotonic() - MODEL_LAST_SPOKE[0] >= seconds
+
+    def playback_drained() -> bool:
+        return out_queue is None or out_queue.empty()
+
+    # Stage 1: wait until the model is quiet AND the playback queue is empty.
     deadline = time.monotonic() + max_wait_quiet
     while time.monotonic() < deadline:
-        if time.monotonic() - MODEL_LAST_SPOKE[0] >= required_quiet:
+        if model_quiet_for(required_quiet) and playback_drained():
             break
         await asyncio.sleep(0.1)
     else:
-        log(f"[!!] announce timeout for {name} (model never went quiet)")
+        log(f"[!!] announce timeout for {name} "
+            f"(model/playback never went quiet)")
         return
 
-    # Stage 2: wait `grace` seconds to see if the model speaks on its own.
+    # Stage 2: grace window — bail if the model resumes speaking on its own.
     last_quiet_marker = MODEL_LAST_SPOKE[0]
     grace_deadline = time.monotonic() + grace
     while time.monotonic() < grace_deadline:
@@ -424,13 +439,14 @@ async def announce_after_response(session, name):
                 f"skipping nudge for {name}")
             return
 
+    silent_for = time.monotonic() - MODEL_LAST_SPOKE[0]
     try:
         await session.send_client_content(
             turns=[types.Content(role="user", parts=[types.Part(text=text)])],
             turn_complete=True,
         )
         log(f"[announce] fallback nudge sent for {name} "
-            f"(model stayed silent for {grace}s after response)")
+            f"(model silent {silent_for:.1f}s, playback drained)")
     except Exception as e:
         log(f"[!!] announce nudge for {name} failed: {e!r}")
 
@@ -622,6 +638,7 @@ async def main():
         loop = asyncio.get_running_loop()
         mic_queue: asyncio.Queue = asyncio.Queue()
         out_queue: asyncio.Queue = asyncio.Queue()
+        OUT_QUEUE_REF[0] = out_queue
 
         async def supervised(name, coro):
             try:
