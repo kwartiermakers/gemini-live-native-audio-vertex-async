@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://sainer.nl">
-    <img src="https://press.sainer.nl/sainer/logos/Primary%20logo/PNG/Logo-Sainer-White.png" alt="Sainer" width="240">
+    <img src="https://press.sainer.nl/sainer/email/Logo-Sainer-Purple.png" alt="Sainer" width="240">
   </a>
 </p>
 
