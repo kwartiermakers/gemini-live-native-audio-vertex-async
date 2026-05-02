@@ -25,6 +25,13 @@ You speak (Dutch or English), the model picks a tool, the tool runs in the
 background while the conversation keeps flowing, and the result is delivered
 back according to its `scheduling` policy.
 
+<p align="center">
+  <video src="https://github.com/kwartiermakers/gemini-live-native-audio-vertex-async/raw/main/assets/VertexAI-Async-Native-Audio-Example.mp4" controls width="720"></video>
+</p>
+
+> If the player above does not render, watch the recording directly:
+> [`assets/VertexAI-Async-Native-Audio-Example.mp4`](assets/VertexAI-Async-Native-Audio-Example.mp4).
+
 ## Setup
 
 ```bash
