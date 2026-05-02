@@ -4,7 +4,7 @@
   </a>
 </p>
 
-# non-blocking-test
+# Asynchronous tool calling with Gemini Native Audio on Vertex AI
 
 > Built by the team behind **[Sainer](https://sainer.nl)**.
 > If this repo helped you, please follow us on
