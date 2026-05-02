@@ -181,7 +181,7 @@ async def log_preference_impl(preference: str):
 
 
 async def search_flights_impl(destination: str):
-    await asyncio.sleep(5)
+    await asyncio.sleep(3)
     log(f"[tool] search_flights DONE destination={destination!r}")
     return {
         "status": "complete",
@@ -256,6 +256,12 @@ RECENT_USER_TEXT: list[str] = [""]
 # Used by the announce-follow-up nudge so we don't barge in mid-sentence.
 MODEL_LAST_SPOKE: list[float] = [0.0]
 
+# Rolling buffer of (timestamp, text) for bot output transcription chunks.
+# announce_after_response uses this to verify whether the model actually
+# said tool-specific content (e.g. flight codes) after the response landed,
+# so we don't nudge a redundant announcement when the model already did one.
+BOT_SPOKEN: list[tuple[float, str]] = []
+
 # Reference to the playback queue, set in main(). The announce-follow-up nudge
 # checks this to avoid barging in while audio is still queued for playback —
 # MODEL_LAST_SPOKE only tracks when audio was RECEIVED from the API, but
@@ -327,7 +333,10 @@ async def run_async_tool(session, call_id, name, coro, scheduling):
         # tells it to speak — relying on the response payload alone is not
         # reliable with native audio.
         if scheduling != "SILENT":
-            asyncio.create_task(announce_after_response(session, name))
+            keywords = _announce_keywords(name, result)
+            asyncio.create_task(
+                announce_after_response(session, name, keywords)
+            )
     finally:
         PENDING[name] = max(0, PENDING.get(name, 0) - 1)
 
@@ -393,20 +402,46 @@ ANNOUNCE_NUDGES = {
 }
 
 
-async def announce_after_response(session, name):
+def _announce_keywords(name, result):
+    """Return content-specific tokens that should appear in the model's
+    speech IF it has actually announced the tool result. The fallback
+    nudge in announce_after_response uses these to distinguish a real
+    announcement from unrelated chatter that just happened to follow
+    the response."""
+    if name == "search_flights":
+        return [r["flight"] for r in result.get("results", []) if r.get("flight")]
+    if name == "urgent_alert":
+        msg = (result.get("message") or "").strip()
+        if not msg:
+            return []
+        words = [
+            w.strip(".,!?;:'\"").lower()
+            for w in msg.split()
+            if len(w.strip(".,!?;:'\"")) >= 4
+        ]
+        return words[:3] if words else [msg.lower()]
+    return []
+
+
+async def announce_after_response(session, name, expected_keywords):
     """Fallback nudge — only fires if the model FAILED to announce the
-    FunctionResponse on its own. Three conditions must all hold:
+    FunctionResponse on its own. Conditions:
       1. The model has been quiet (no new audio data) for `required_quiet`s.
       2. The playback queue is drained — the user has actually finished
          hearing the previous audio. Without this, we'd barge in while the
          buffered tail of the previous turn is still playing.
-      3. After both of the above, a `grace` window passes with no new audio
-         from the model. If it starts speaking on its own, we skip the nudge.
+      3. The model has not uttered any tool-specific keyword since the
+         response was sent. Trailing speech from a pre-response monologue
+         doesn't count — we look for actual result content (flight codes,
+         alert message words).
+      4. After all of the above, a short grace window passes during which
+         the model is given one last chance to announce on its own.
     """
     text = ANNOUNCE_NUDGES.get(name)
     if not text:
         return
 
+    response_sent_at = time.monotonic()
     required_quiet = 1.5
     grace = 2.5
     max_wait_quiet = 30.0
@@ -418,9 +453,21 @@ async def announce_after_response(session, name):
     def playback_drained() -> bool:
         return out_queue is None or out_queue.empty()
 
-    # Stage 1: wait until the model is quiet AND the playback queue is empty.
+    def model_announced() -> bool:
+        if not expected_keywords:
+            return False
+        spoken = " ".join(
+            t for ts, t in BOT_SPOKEN if ts > response_sent_at
+        ).lower()
+        return any(kw.lower() in spoken for kw in expected_keywords)
+
+    # Stage 1: wait until the model is quiet AND the playback queue is empty,
+    # OR until we detect the model has already announced the result.
     deadline = time.monotonic() + max_wait_quiet
     while time.monotonic() < deadline:
+        if model_announced():
+            log(f"[announce] model already announced — skipping nudge for {name}")
+            return
         if model_quiet_for(required_quiet) and playback_drained():
             break
         await asyncio.sleep(0.1)
@@ -429,13 +476,13 @@ async def announce_after_response(session, name):
             f"(model/playback never went quiet)")
         return
 
-    # Stage 2: grace window — bail if the model resumes speaking on its own.
-    last_quiet_marker = MODEL_LAST_SPOKE[0]
+    # Stage 2: grace window — give the model one last chance to start
+    # announcing on its own before we nudge.
     grace_deadline = time.monotonic() + grace
     while time.monotonic() < grace_deadline:
         await asyncio.sleep(0.1)
-        if MODEL_LAST_SPOKE[0] > last_quiet_marker:
-            log(f"[announce] model started speaking on its own — "
+        if model_announced():
+            log(f"[announce] model announced during grace — "
                 f"skipping nudge for {name}")
             return
 
@@ -532,7 +579,9 @@ async def handle_response(session, response, out_queue):
             RECENT_USER_TEXT[0] = (RECENT_USER_TEXT[0] + " " + sc.input_transcription.text)[-500:]
         if sc.output_transcription and sc.output_transcription.text:
             log(f"[bot ] {sc.output_transcription.text}")
-            MODEL_LAST_SPOKE[0] = time.monotonic()
+            now = time.monotonic()
+            MODEL_LAST_SPOKE[0] = now
+            BOT_SPOKEN.append((now, sc.output_transcription.text))
         if sc.interrupted:
             drained = 0
             while not out_queue.empty():
@@ -627,7 +676,7 @@ async def main():
         output_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
-    print(f"Connecting to {MODEL} via Vertex ({PROJECT} / {LOCATION})…")
+    print(f"Connecting to {MODEL} via Vertex…")
     async with client.aio.live.connect(model=MODEL, config=config) as session:
         print("Connected. Speak Dutch or English. Ctrl+C to quit.\n"
               "Try: 'Wat is het nu voor tijd?', 'Onthoud dat ik van koffie hou',\n"
