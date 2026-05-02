@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://sainer.nl">
+    <img src="https://press.sainer.nl/sainer/logos/Primary%20logo/PNG/Logo-Sainer-White.png" alt="Sainer" width="240">
+  </a>
+</p>
+
 # non-blocking-test
 
 > Built by the team behind **[Sainer](https://sainer.nl)**.
